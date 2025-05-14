@@ -26,8 +26,13 @@ from natsort import natsorted
 from concurrent.futures import ProcessPoolExecutor
 import nibabel as nib
 import re
+import subprocess
 
-from COPY_step4_segment_all_uninterleaved_echoes import chunks_fullpaths
+from skimage.morphology import binary_dilation
+from scipy.ndimage import binary_fill_holes
+
+import csv
+
 
 
 def usage():
@@ -112,6 +117,38 @@ def split_nii(in_folder, out_folder, starts_with_even, nnunet_prep=False):
             nii1 = nib.Nifti1Image(img1, affine)
             nib.save(nii1, os.path.join(out_folder, "%04d.nii.gz" % (2 * i + 1)))
 
+
+def getNumEchoes(cwd, subj, chunk):
+    # Get all the files for that chunk
+    files = glob.glob(cwd + f'/multiecho-images/{subj}/echoes/{chunk}/' + '*.nii.gz')
+
+    # Initialize list to store extracted numbers
+    echo_numbers = []
+
+    # Loop through files and extract echo numbers
+    for file in files:
+        match = re.search(r'_e(\d+)\.nii\.gz$', file)
+        if match:
+            echo_numbers.append(int(match.group(1)))
+
+    return echo_numbers
+
+def runShellScript(script_path):
+    # Set environment variables for nnUNet
+    os.environ["nnUNet_raw"] = "/neuro/labs/grantlab/research/uterus_data/registration/nnUNet_raw"
+    os.environ["nnUNet_preprocessed"] = "/neuro/labs/grantlab/research/uterus_data/registration/nnUNet_preprocessed"
+    os.environ["nnUNet_results"] = "/neuro/labs/grantlab/research/uterus_data/registration/nnUNet_results"
+
+    # Make excecutable
+    os.chmod(script_path, 0o775)
+
+    # Run script
+    try:
+        subprocess.run([script_path], check=True)
+        print("Prediction script executed successfully.")
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while running the script: {e}")
+
 # ===============================================================================
 # Main Steps
 # ===============================================================================
@@ -184,19 +221,8 @@ def step3(subjs, cwd, max_processes):
         # Loop through all the chunks
         for chunk in chunks:
             # Create necessary directories
-            # Make echoes dynamic
-
-            # Get all the files for that chunk
-            files = glob.glob(cwd + f'/multiecho-images/{subj}/echoes/{chunk}/' + '*.nii.gz')
-
-            # Initialize list to store extracted numbers
-            echo_numbers = []
-
-            # Loop through files and extract echo numbers
-            for file in files:
-                match = re.search(r'_e(\d+)\.nii\.gz$', file)
-                if match:
-                    echo_numbers.append(int(match.group(1)))
+            # Get the correct number of echoes for this subject (dynamic)
+            echo_numbers = getNumEchoes(cwd, subj, chunk)
 
             for echo in echo_numbers:
                 # Make folders based on echo number
@@ -243,24 +269,149 @@ def step3(subjs, cwd, max_processes):
 
     return chunks
 
-def step4(subjs, chunks):
+def step4(subjs, chunks, cwd):
+    # Define script path
+    script_path = os.path.join(cwd + 'run_segment_all_uninterleaved_echoes.sh')
+    # Open script for writing
+    with open(script_path, 'w') as f:
+        f.write('#!/bin/bash\n\n')
+        print("Script opened for step 4")
+        # Loop through subjects we are analyzing
+        for subj in subjs:
+            for chunk in chunks:
+                # Dynamically get the number of echoes for this subject and chunk
+                echo_numbers = getNumEchoes(cwd, subj, chunk)
+                # Loop through echoes
+                for echo in echo_numbers:
+                    # Create output directory
+                    output_dir = os.path.join(
+                        cwd, f'multiecho-images/{subj}/echoes_split_uninterleaved_segmentations/{chunk}/echo_{echo}/'
+                    )
+                    os.makedirs(output_dir, exist_ok=True)
 
+                    # Compose input and output paths
+                    input_path = os.path.join(
+                        cwd, f'multiecho-images/{subj}/echoes_split_uninterleaved/{chunk}/echo_{echo}/'
+                    )
+
+                    # Build command
+                    command = (
+                        f'nnUNetv2_predict -d 999 -i "{input_path}" -o "{output_dir}" '
+                        f'-f 0 1 2 3 4 -c 3d_fullres -chk checkpoint_best.pth\n'
+                    )
+
+                    f.write(command)
+    print("All commands added to script")
+    # Make script excecutable & run it
+    print("Running script")
+    runShellScript(script_path)
+
+def step5(subjs, chunks, cwd):
+    # Create the shell script file and write the command to it
+    # Define script path
+    script_path = os.path.join(cwd + 'run_independent_bfc_echo1.sh')
+    with open(script_path, 'w') as f:
+        f.write('#!/bin/bash\n\n')
+        # Loop through all subjects being analyzed
+        for subj in subjs:
+            # Loop through all chunks for each subject
+            for chunk in chunks:
+
+                # Create necessary directories for the first echo
+                for echo in [1]:
+                    os.makedirs(
+                        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc/{chunk}/echo_{echo}/',
+                        exist_ok=True
+                    )
+
+                    os.makedirs(
+                        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_uterusmask/{chunk}/echo_{echo}/',
+                        exist_ok=True
+                    )
+
+                    imgs = natsorted(glob.glob(
+                        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved/{chunk}/echo_{echo}/*.nii.gz'))
+                    segs = natsorted(glob.glob(
+                        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations/{chunk}/echo_{echo}/*.nii.gz'))
+
+                    assert len(imgs) == len(segs)
+                    assert len(imgs) > 0
+
+
+                    for j, (img, seg) in enumerate(zip(imgs, segs)):
+
+                        if j % 10 == 0:
+                            simult = ''
+                        else:
+                            simult = '&'
+
+                        # Create and save binary version of multilabel seg to be used as BFC mask:
+                        nii = nib.load(seg)
+                        segarr = nii.get_fdata()
+                        segarr = (segarr > 0).astype(np.uint8)
+
+                        segarr = binary_dilation(segarr)
+                        segarr = binary_fill_holes(segarr)
+                        segarr = segarr.astype(np.uint8)
+
+                        nib.save(
+                            nib.Nifti1Image(segarr, nii.affine),
+                            '{}/{}'.format(
+                                cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_uterusmask/{chunk}/echo_{echo}/',
+                                os.path.basename(seg)),
+                        )
+                        # Create shell script command
+                        out_dir = os.path.join(cwd,f'multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc/{chunk}/echo_{echo}/')
+                        mask_dir = os.path.join(cwd,f'multiecho-images/{subj}/echoes_split_uninterleaved_uterusmask/{chunk}/echo_{echo}/')
+                        img_name = os.path.basename(img)
+                        seg_name = os.path.basename(seg)
+
+                        command = (
+                            f'N4BiasFieldCorrection -r 0 -d 3 -i "{img}" '
+                            f'-o ["{out_dir}/{img_name}", placeholder.nii.gz] '
+                            f'-w "{mask_dir}/{seg_name}" -v -s 2 -c [400x400x400,0.00] {simult}\n'
+                        )
+                        # Write command to shell script
+                        f.write(command)
+
+    # Run through shell script function
+    runShellScript(script_path)
+
+def step6(subjs, chunks, cwd):
+    # Loop through each subject we are analyzing
     for subj in subjs:
-
+        # Loop through each chunk for that subject
         for chunk in chunks:
-            splitter = ['&', '&', '']
 
             # Create necessary directories
-            for echo in range(3):
+            for echo in [1]:
                 os.makedirs(
-                    os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations/{chunk}/echo_{echo}/',
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_{echo}/',
                     exist_ok=True
                 )
 
-                print('nnUNetv2_predict -d 999 -i {} -o {} -f 0 1 2 3 4 -c 3d_fullres -chk checkpoint_best.pth'.format(
-                    os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved/{chunk}/echo_{echo}/',
-                    os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations/{chunk}/echo_{echo}/'
-                ))
+                imgs = natsorted(glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc/{chunk}/echo_{echo}/*.nii.gz'))
+                segs = natsorted(glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations/{chunk}/echo_{echo}/*.nii.gz'))
+
+                assert len(imgs) == len(segs)
+                assert len(imgs) > 0
+
+                with open(
+                        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc/{chunk}/imgseg_paths.csv',
+                        'w') as stream:
+                    writer = csv.writer(stream, quoting=csv.QUOTE_NONE, quotechar='', lineterminator='\n')
+                    for img, seg in zip(imgs, segs):
+                        writer.writerow([os.path.abspath(img), os.path.abspath(seg)])
+
+                with open(
+                        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc/{chunk}/atlas_build.sh',
+                        'w') as stream:
+                    stream.write(
+                        'antsMultivariateTemplateConstruction2.sh -d 3 -a 2 -k 2 -o {}/T_ -g 0.25  -j 8 -w 1x0.2  -n 0  -r 1  -i 4  -c 2  -m CC[2]  -m MSQ  -l 1  -t "SyN[0.3, 1.5, 0]" -q 100x100x80x60x30x30  -f 4x4x3x2x1x1  -s 2.5x2.0x1.5x1.0x0.5x0.0  -b 0  imgseg_paths.csv'.format(
+                            cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_{echo}/'))
+
 
 def main():
     # Globally define current working directory
@@ -292,15 +443,31 @@ def main():
     # ================================================================================
     # Define subjects as the ones listed in the multi echo images folder
     # User-defined number of parallel processes
-    max_processes = input("Please enter the number of parallel processes you want to move forward with: ")
+    max_processes = int(input("Please enter the number of parallel processes you want to move forward with: "))
     # Currently 8
     subjects = natsorted(os.listdir(cwd + '/multiecho-images/'))
     chunks = step3(subjects, cwd, max_processes)
+    # print("Step 3 complete")
 
     # ================================================================================
     # Step 4 - Segment all uninterleaved echoes
     # ================================================================================
-    step4(subjects, chunks)
+    # step4(subjects, chunks, cwd)
+    # print("Step 4 complete")
+
+    # ================================================================================
+    # Step 5 - Copy Independent bfc for echo 1
+    # ================================================================================
+    # step5(subjects, chunks, cwd)
+    # print("Step 5 complete")
+
+    # ================================================================================
+    # Step 6 - Create image csv files
+    # ================================================================================
+    step6(subjects, chunks, cwd)
+    print("Step 6 complete")
+
+
 
 if __name__ == "__main__":
     main()
