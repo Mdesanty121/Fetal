@@ -31,6 +31,8 @@ import subprocess
 from skimage.morphology import binary_dilation
 from scipy.ndimage import binary_fill_holes
 
+from multiprocessing import Pool
+
 import csv
 
 
@@ -148,6 +150,83 @@ def runShellScript(script_path):
         print("Prediction script executed successfully.")
     except subprocess.CalledProcessError as e:
         print(f"An error occurred while running the script: {e}")
+
+
+def compose_transform(args):
+    warp, linear, savedir, subj, chunk = args
+    output_path = os.path.join(savedir, os.path.basename(warp))
+    template_path = os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/T_template0.nii.gz'
+
+    cmd = f'ComposeMultiTransform 3 {output_path} -R {template_path} {warp} {linear}'
+    os.system(cmd)
+
+
+def process_single_image(args):
+    i, echo, input_img, input_seg, warp, template = args
+    output_img = os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/{os.path.basename(input_img)}'
+    output_seg = os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/{os.path.basename(input_seg)}'
+
+    os.system(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_img} -o {output_img} -n Linear -v')
+    os.system(
+        f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_seg} -o {output_seg} -n GenericLabel -v')
+
+    # print(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_img} -o {output_img} -n Linear -v')
+    # print(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_seg} -o {output_seg} -n GenericLabel -v')
+
+    # Check if output files were created
+    if not os.path.exists(output_img):
+        # import pdb; pdb.set_trace()
+        raise RuntimeError(f"Failed to create output image: {output_img}")
+    if not os.path.exists(output_seg):
+        # import pdb; pdb.set_trace()
+        raise RuntimeError(f"Failed to create output segmentation: {output_seg}")
+
+
+def process_echo(args):
+    subj, chunk, echo = args
+
+    os.makedirs(
+        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration/{chunk}/echo_{echo}/',
+        exist_ok=True
+    )
+
+    print('Processing subject {} chunk {} echo {}'.format(subj, chunk, echo))
+
+    imgs = natsorted(glob.glob(
+        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/*.nii.gz'))
+    segs = natsorted(glob.glob(
+        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/*.nii.gz'))
+    if len(imgs) == 0:
+        print('No images found for subject {} chunk {} echo {}'.format(subj, chunk, echo))
+        return
+
+    assert len(imgs) == len(segs)
+
+    # Create average image
+    ref = nib.load(imgs[0])
+    average_img = np.zeros_like(ref.get_fdata()).astype(np.float32)
+    print('averaging images')
+
+    for i in range(len(imgs)):
+        average_img += nib.load(imgs[i]).get_fdata().astype(np.float32)
+
+    average_img = average_img / len(imgs)
+
+    nib.save(
+        nib.Nifti1Image(
+            average_img,
+            ref.affine,
+        ),
+        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration/{chunk}/echo_{echo}/average.nii.gz'
+    )
+
+def compute_jacobian(args):
+    warp, savedir = args
+    cmd = 'CreateJacobianDeterminantImage 3 {} {}/{}.nii.gz 1 1'.format(
+        warp, savedir, os.path.basename(warp),
+    )
+    os.system(cmd)
+
 
 # ===============================================================================
 # Main Steps
@@ -412,6 +491,219 @@ def step6(subjs, chunks, cwd):
                         'antsMultivariateTemplateConstruction2.sh -d 3 -a 2 -k 2 -o {}/T_ -g 0.25  -j 8 -w 1x0.2  -n 0  -r 1  -i 4  -c 2  -m CC[2]  -m MSQ  -l 1  -t "SyN[0.3, 1.5, 0]" -q 100x100x80x60x30x30  -f 4x4x3x2x1x1  -s 2.5x2.0x1.5x1.0x0.5x0.0  -b 0  imgseg_paths.csv'.format(
                             cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_{echo}/'))
 
+def step7(subjs, chunks, cwd):
+    base_dir = '/net/rc-fs-nfs.tch.harvard.edu/FNNDSC-e2/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel/multiecho-images/'
+    for subj in subjs:
+
+        for chunk in chunks:
+            for echo in [1]:
+                # Define paths
+                script_dir = os.path.join(cwd,f'multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc/{chunk}')
+                script_path = os.path.join(script_dir, 'run_atlas_build.sh')
+
+                # Ensure the directory exists
+                os.makedirs(script_dir, exist_ok=True)
+
+                # Write the shell script
+                with open(script_path, 'w') as f:
+                    f.write('#!/bin/bash\n')
+                    f.write('cd "{}"\n'.format(script_dir))
+                    f.write('sh atlas_build.sh\n')
+
+    # Make it executable and run it
+    runShellScript(script_path)
+
+def step8(subjs, chunks, cwd):
+    for subj in subjs:
+
+        for chunk in chunks:
+
+            # Create necessary directories
+            for echo in [1]:
+                os.makedirs(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_composedwarps/{chunk}/echo_{echo}/',
+                    exist_ok=True
+                )
+
+            # Load input images/echoes to warp
+            input_e0 = natsorted(
+                glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved/{chunk}/echo_0/*.nii.gz'
+                )
+            )
+
+            # Load warps to apply:
+            warps = natsorted(
+                glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/*[!Inverse]Warp.nii.gz'
+                )
+            )
+
+            # Check if warps is empty and log to file if so
+            if len(warps) == 0:
+                with open('empty_warps.log', 'a') as f:
+                    warp_path = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/'
+                    f.write(f"Empty warps directory: {warp_path}\n")
+                continue
+
+            linears = natsorted(
+                glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/*GenericAffine.mat'
+                )
+            )
+            del linears[-1]
+
+            # import pdb; pdb.set_trace()
+
+            assert len(input_e0) > 0
+            assert len(warps) == len(input_e0)
+            assert len(warps) == len(linears)
+
+            for echo in [1]:
+                savedir = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_composedwarps/{chunk}/echo_{echo}/'
+                os.makedirs(
+                    savedir,
+                    exist_ok=True
+                )
+                with Pool(16) as pool:
+                    args = [(warps[k], linears[k], savedir, subj, chunk) for k in range(len(warps))]
+                    pool.map(compose_transform, args)
+
+def step9(subjs, chunks, cwd):
+    for subj in subjs:
+
+        for chunk in chunks:
+
+            # Create necessary directories and load input images/segmentations
+            input_imgs = []
+            input_segs = []
+
+            for echo in range(3):
+                os.makedirs(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/',
+                    exist_ok=True
+                )
+                os.makedirs(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/',
+                    exist_ok=True
+                )
+
+                input_imgs.append(
+                    natsorted(
+                        glob.glob(
+                            cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved/{chunk}/echo_{echo}/*.nii.gz'
+                        )
+                    )
+                )
+                input_segs.append(
+                    natsorted(
+                        glob.glob(
+                            cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations/{chunk}/echo_{echo}/*.nii.gz'
+                        )
+                    )
+                )
+
+            assert len(input_imgs[0]) > 0
+            assert len(input_imgs[0]) == len(input_imgs[1])
+            assert len(input_imgs[0]) == len(input_imgs[2])
+
+            assert len(input_segs[0]) > 0
+            assert len(input_segs[0]) == len(input_segs[1])
+            assert len(input_segs[0]) == len(input_segs[2])
+
+            assert len(input_imgs[0]) == len(input_segs[0])
+            assert len(input_imgs[1]) == len(input_segs[1])
+            assert len(input_imgs[2]) == len(input_segs[2])
+
+            # Load warps to apply:
+            warps = natsorted(
+                glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_composedwarps/{chunk}/echo_1/*[!Inverse]Warp.nii.gz'
+                )
+            )
+
+            # Check if warps is empty and log to file if so
+            if len(warps) == 0:
+                with open('empty_warps_for_other_echoes.log', 'a') as f:
+                    warp_path = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/'
+                    f.write(f"Empty warps directory: {warp_path}\n")
+                continue
+
+            assert len(warps) == len(input_imgs[0])
+
+            template = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/T_template0.nii.gz'
+
+            # Call antsApplyTransforms for each echo:
+            for echo in range(3):
+                with Pool(16) as pool:
+                    args = [(i, echo, input_imgs[echo][i], input_segs[echo][i], warps[i], template)
+                            for i in range(len(input_imgs[echo]))]
+                    pool.map(process_single_image, args)
+
+def step10(subjs, chunks, cwd):
+    for subj in subjs:
+
+        for chunk in chunks:
+            # Replace the echo loop with parallel processing
+            with Pool(3) as pool:  # Create 3 processes, one for each echo
+                args = [(subj, chunk, echo) for echo in range(3)]
+                pool.map(process_echo, args)
+
+            print('majority voting')
+            for echo in [1]:
+                os.makedirs(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration_segmentation/{chunk}/echo_{echo}/',
+                    exist_ok=True
+                )
+                segs = natsorted(glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/*.nii.gz'))
+
+                if len(segs) == 0:
+                    print('No segmentations found for subject {} chunk {} echo {}'.format(subj, chunk, echo))
+                    continue
+
+                # Create majority vote image
+                majority_vote_string = 'ImageMath 3 {} MajorityVoting '.format(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration_segmentation/{chunk}/echo_{echo}/majority_vote.nii.gz'
+                )
+
+                for i in range(len(segs)):
+                    majority_vote_string += f' {segs[i]} '
+
+                # import pdb; pdb.set_trace()
+
+                os.system(majority_vote_string)
+
+def step11(subjs, chunks, cwd):
+    for subj in subjs:
+
+        for chunk in chunks:
+            print(f'{subj} chunk {chunk}')
+            # Load warps to apply:
+            warps = natsorted(
+                glob.glob(
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_composedwarps/{chunk}/echo_1/*.nii.gz'
+                )
+            )
+
+            # Check if warps is empty and log to file if so
+            if len(warps) == 0:
+                # with open('empty_warps.log', 'a') as f:
+                #    warp_path = os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/'
+                #    f.write(f"Empty warps directory: {warp_path}\n")
+                continue
+
+            # Create necessary directories
+            savedir = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_composedwarps_logdetjacs/{chunk}/echo_1/'
+            os.makedirs(
+                savedir,
+                exist_ok=True
+            )
+
+            # Replace the for loop with parallel processing
+            args = [(warp, savedir) for warp in warps]
+            with Pool(16) as pool:
+                pool.map(compute_jacobian, args)
 
 def main():
     # Globally define current working directory
@@ -464,10 +756,38 @@ def main():
     # ================================================================================
     # Step 6 - Create image csv files
     # ================================================================================
-    step6(subjects, chunks, cwd)
-    print("Step 6 complete")
+    # step6(subjects, chunks, cwd)
+    # print("Step 6 complete")
 
+    # ================================================================================
+    # Step 7 - Create atlasing calls
+    # ================================================================================
+    # step7(subjects, chunks, cwd)
+    # print("Step 7 complete")
 
+    # ================================================================================
+    # Step 8 - Compose linear/nonlinear warps
+    # ================================================================================
+    # step8(subjects, chunks, cwd)
+    # print("Step 8 complete")
+
+    # ================================================================================
+    # Step 9 - Warp other echoes
+    # ================================================================================
+    # step9(subjects, chunks, cwd)
+    # print("Step 9 complete")
+
+    # ================================================================================
+    # Step 10 - Create averages and majority votes
+    # ================================================================================
+    # step10(subjects, chunks, cwd)
+    # print("Step 10 complete")
+
+    # ================================================================================
+    # Step 11 - Compute lodgetjacs
+    # ================================================================================
+    step11(subjects, chunks, cwd)
+    print("Step 11 complete")
 
 if __name__ == "__main__":
     main()
