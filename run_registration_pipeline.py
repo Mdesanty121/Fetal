@@ -149,37 +149,35 @@ def runShellScript(script_path):
         subprocess.run([script_path], check=True)
         print("Prediction script executed successfully.")
     except subprocess.CalledProcessError as e:
-        print(f"An error occurred while running the script: {e}")
+        with open("error.log", "a") as log_file:
+            log_file.write(f"An error occurred while running the script: {e}\n")
 
 
-def compose_transform(args):
+def compose_transform(arg_tuple):
+    args, cwd = arg_tuple
     warp, linear, savedir, subj, chunk = args
+
     output_path = os.path.join(savedir, os.path.basename(warp))
-    template_path = os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/T_template0.nii.gz'
+    template_path = os.path.join(cwd,f'multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/T_template0.nii.gz')
 
     cmd = f'ComposeMultiTransform 3 {output_path} -R {template_path} {warp} {linear}'
     os.system(cmd)
 
 
 def process_single_image(args):
-    i, echo, input_img, input_seg, warp, template = args
-    output_img = os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/{os.path.basename(input_img)}'
-    output_seg = os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/{os.path.basename(input_seg)}'
+    i, echo, input_img, input_seg, warp, template, subj, chunk, cwd = args
+
+    output_img = os.path.join(cwd,f'multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/{os.path.basename(input_img)}')
+    output_seg = os.path.join(cwd, f'multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/{os.path.basename(input_seg)}')
 
     os.system(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_img} -o {output_img} -n Linear -v')
-    os.system(
-        f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_seg} -o {output_seg} -n GenericLabel -v')
+    os.system(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_seg} -o {output_seg} -n GenericLabel -v')
 
-    # print(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_img} -o {output_img} -n Linear -v')
-    # print(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_seg} -o {output_seg} -n GenericLabel -v')
-
-    # Check if output files were created
     if not os.path.exists(output_img):
-        # import pdb; pdb.set_trace()
         raise RuntimeError(f"Failed to create output image: {output_img}")
     if not os.path.exists(output_seg):
-        # import pdb; pdb.set_trace()
         raise RuntimeError(f"Failed to create output segmentation: {output_seg}")
+
 
 
 def process_echo(args):
@@ -302,7 +300,6 @@ def step3(subjs, cwd, max_processes):
             # Create necessary directories
             # Get the correct number of echoes for this subject (dynamic)
             echo_numbers = getNumEchoes(cwd, subj, chunk)
-
             for echo in echo_numbers:
                 # Make folders based on echo number
                 os.makedirs(
@@ -338,7 +335,7 @@ def step3(subjs, cwd, max_processes):
             # Parallel split_nii execution
             with ProcessPoolExecutor(max_processes) as executor:
                 futures = []
-                for echo_idx in range(3):
+                for echo_idx in echo_numbers:
                     futures.append(executor.submit(run_split_nii, subj, chunk, echo_idx))
 
                 # Ensure all split tasks are completed before proceeding
@@ -528,7 +525,7 @@ def step8(subjs, chunks, cwd):
             # Load input images/echoes to warp
             input_e0 = natsorted(
                 glob.glob(
-                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved/{chunk}/echo_0/*.nii.gz'
+                    cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved/{chunk}/echo_1/*.nii.gz'
                 )
             )
 
@@ -567,7 +564,8 @@ def step8(subjs, chunks, cwd):
                 )
                 with Pool(16) as pool:
                     args = [(warps[k], linears[k], savedir, subj, chunk) for k in range(len(warps))]
-                    pool.map(compose_transform, args)
+                    inputs = [(a, cwd) for a in args]
+                    pool.map(compose_transform, inputs)
 
 def step9(subjs, chunks, cwd):
     for subj in subjs:
@@ -577,8 +575,10 @@ def step9(subjs, chunks, cwd):
             # Create necessary directories and load input images/segmentations
             input_imgs = []
             input_segs = []
-
-            for echo in range(3):
+            # Dynamic echoes
+            echo_numbers = getNumEchoes(cwd, subj, chunk)
+            # Loop through echoes
+            for echo in echo_numbers:
                 os.makedirs(
                     cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/',
                     exist_ok=True
@@ -602,7 +602,6 @@ def step9(subjs, chunks, cwd):
                         )
                     )
                 )
-
             assert len(input_imgs[0]) > 0
             assert len(input_imgs[0]) == len(input_imgs[1])
             assert len(input_imgs[0]) == len(input_imgs[2])
@@ -634,10 +633,12 @@ def step9(subjs, chunks, cwd):
             template = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/T_template0.nii.gz'
 
             # Call antsApplyTransforms for each echo:
-            for echo in range(3):
+            for echo in echo_numbers:
                 with Pool(16) as pool:
-                    args = [(i, echo, input_imgs[echo][i], input_segs[echo][i], warps[i], template)
-                            for i in range(len(input_imgs[echo]))]
+                    args = [
+                        (i, echo, input_imgs[echo][i], input_segs[echo][i], warps[i], template, subj, chunk, cwd)
+                        for i in range(len(input_imgs[echo]))
+                    ]
                     pool.map(process_single_image, args)
 
 def step10(subjs, chunks, cwd):
@@ -768,8 +769,8 @@ def main():
     # ================================================================================
     # Step 8 - Compose linear/nonlinear warps
     # ================================================================================
-    # step8(subjects, chunks, cwd)
-    # print("Step 8 complete")
+    step8(subjects, chunks, cwd)
+    print("Step 8 complete")
 
     # ================================================================================
     # Step 9 - Warp other echoes
@@ -786,8 +787,8 @@ def main():
     # ================================================================================
     # Step 11 - Compute lodgetjacs
     # ================================================================================
-    step11(subjects, chunks, cwd)
-    print("Step 11 complete")
+    # step11(subjects, chunks, cwd)
+    # print("Step 11 complete")
 
 if __name__ == "__main__":
     main()
