@@ -35,14 +35,16 @@ from multiprocessing import Pool
 
 import csv
 
+import os
+import logging
 
 
 def usage():
     print("""
-    AUTHOR: megan.desanty@childrens,harvard.edu
+    AUTHOR: megan.desanty@childrens,harvard.edu, mdesanty121@gmail.com
 
     DESCRIPTION:
-        Main class to complete the registration pipeline
+        Main class to complete the registration & segmentation pipeline
 
     USAGE:  
         python3 run_registration_pipeline.py
@@ -52,6 +54,35 @@ def usage():
 # ===============================================================================
 # Helper functions
 # ===============================================================================
+
+def check_output_img(output_img):
+    """
+    Function to check if an image exists
+
+    type	'output_img': string
+    param       : path to a .nii.gz file
+
+    Returns: Updates log if failed to locate image
+
+    """
+    if not os.path.exists(output_img):
+        logging.error(f"Failed to create output image: {output_img}")
+
+def check_output_seg(output_seg):
+    """
+    Function to check if an segmentation exists
+
+    type	'output_seg': string
+    param       : path to a .nii.gz file
+
+    Returns: Updates log if failed to locate image
+
+    """
+
+    if not os.path.exists(output_seg):
+        logging.error(f"Failed to create output segmentation: {output_seg}")
+
+
 # Function to run split_nii
 def run_split_nii(subj, chunk, echo_idx):
     split_nii(
@@ -173,6 +204,10 @@ def process_single_image(args):
     os.system(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_img} -o {output_img} -n Linear -v')
     os.system(f'antsApplyTransforms -d 3 -e 0 -t {warp} -r {template} -i {input_seg} -o {output_seg} -n GenericLabel -v')
 
+    # Check to make sure images are there and add issues to log if they are not
+    check_output_img(output_img)
+    check_output_seg(output_seg)
+
     if not os.path.exists(output_img):
         raise RuntimeError(f"Failed to create output image: {output_img}")
     if not os.path.exists(output_seg):
@@ -181,19 +216,25 @@ def process_single_image(args):
 
 
 def process_echo(args):
-    subj, chunk, echo = args
+    subj, chunk, echo, cwd = args
+    img_path = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/*.nii.gz'
+    seg_path = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/*.nii.gz'
 
+    print(f"Looking for images in: {img_path}")
+    print(f"Looking for segmentations in: {seg_path}")
+
+    imgs = natsorted(glob.glob(img_path))
+    segs = natsorted(glob.glob(seg_path))
     os.makedirs(
-        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration/{chunk}/echo_{echo}/',
+        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration/{chunk}/echo_{echo}/',
         exist_ok=True
     )
-
     print('Processing subject {} chunk {} echo {}'.format(subj, chunk, echo))
 
     imgs = natsorted(glob.glob(
-        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/*.nii.gz'))
+        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_registered/{chunk}/echo_{echo}/*.nii.gz'))
     segs = natsorted(glob.glob(
-        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/*.nii.gz'))
+        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_segmentations_registered/{chunk}/echo_{echo}/*.nii.gz'))
     if len(imgs) == 0:
         print('No images found for subject {} chunk {} echo {}'.format(subj, chunk, echo))
         return
@@ -215,7 +256,7 @@ def process_echo(args):
             average_img,
             ref.affine,
         ),
-        os.getcwd() + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration/{chunk}/echo_{echo}/average.nii.gz'
+        cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_averagepostregistration/{chunk}/echo_{echo}/average.nii.gz'
     )
 
 def compute_jacobian(args):
@@ -633,11 +674,11 @@ def step9(subjs, chunks, cwd):
             template = cwd + f'/multiecho-images/{subj}/echoes_split_uninterleaved_indepbfc_atlased/{chunk}/echo_1/T_template0.nii.gz'
 
             # Call antsApplyTransforms for each echo:
-            for echo in echo_numbers:
+            for idx, echo in enumerate(echo_numbers):
                 with Pool(16) as pool:
                     args = [
-                        (i, echo, input_imgs[echo][i], input_segs[echo][i], warps[i], template, subj, chunk, cwd)
-                        for i in range(len(input_imgs[echo]))
+                        (i, echo, input_imgs[idx][i], input_segs[idx][i], warps[i], template, subj, chunk, cwd)
+                        for i in range(len(input_imgs[idx]))
                     ]
                     pool.map(process_single_image, args)
 
@@ -645,9 +686,11 @@ def step10(subjs, chunks, cwd):
     for subj in subjs:
 
         for chunk in chunks:
+            # Dynamic echoes
+            echo_numbers = getNumEchoes(cwd, subj, chunk)
             # Replace the echo loop with parallel processing
-            with Pool(3) as pool:  # Create 3 processes, one for each echo
-                args = [(subj, chunk, echo) for echo in range(3)]
+            with Pool(len(echo_numbers)) as pool:
+                args = [(subj, chunk, echo, cwd) for echo in echo_numbers]
                 pool.map(process_echo, args)
 
             print('majority voting')
@@ -670,8 +713,6 @@ def step10(subjs, chunks, cwd):
 
                 for i in range(len(segs)):
                     majority_vote_string += f' {segs[i]} '
-
-                # import pdb; pdb.set_trace()
 
                 os.system(majority_vote_string)
 
@@ -707,64 +748,93 @@ def step11(subjs, chunks, cwd):
                 pool.map(compute_jacobian, args)
 
 def main():
+    # ================================================================================
+    # ERROR LOG CONFIGURATION
+    # ================================================================================
+    # Ask for the directory where the log should be stored
+    log_dir = input("Please enter the directory where you would like the error log stored: ").strip()
+
+    # Create the directory or ensure that it exists
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Combine directory and filename
+    log_file = os.path.join(log_dir, 'Registration_pipeline_error_log.log')
+
+    # Set up logging configuration
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.ERROR,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+    )
+
+    # ================================================================================
+    # CURRENT WORKING DIRECTORY
+    # ================================================================================
+
     # Globally define current working directory
     cwd = input("Please define the directory where you want all the folders to be created: ")
     # Currently: '/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel'
-    #
-    # # ================================================================================
-    # # Step 1 - copy multiecho time series
-    # # ================================================================================
-    # # Ask for source_dir, destination_dir, and excel file location
-    # source_dir = input("Please enter the destination of your multiecho files: ")
-    # # Current location: '/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel/data'
-    # dest_dir = input("Please enter the destination of where you want your outputs to be placed: ")
-    # # Current location: '/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel/multiecho-images/'
-    # excel_file = input("Please enter the location (including the file name) of the excel file containing the subject ID's you want to analyze: ")
-    # # Current location: '/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel/subj_list_TTTS_test.xlsx'
-    # # Call the first step function
-    # step1(source_dir, dest_dir, excel_file)
-    # print("Step 1 complete")
-    #
-    # # ================================================================================
-    # # Step 2 - Create chunks of three
-    # # ================================================================================
-    # step2(dest_dir)
-    # print("Step 2 complete")
-    #
+
+    
+    # ================================================================================
+    # START OF PIPELINE
+    # ================================================================================
+
+
+    # ================================================================================
+    # Step 1 - copy multiecho time series
+    # ================================================================================
+    # Ask for source_dir, destination_dir, and excel file location
+    source_dir = input("Please enter the destination of your multiecho files: ")
+    # Current location: '/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel/data'
+    dest_dir = input("Please enter the destination of where you want your outputs to be placed: ")
+    # Current location: '/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel/multiecho-images/'
+    excel_file = input("Please enter the location (including the file name) of the excel file containing the subject ID's you want to analyze: ")
+    # Current location: '/neuro/labs/grantlab/research/uterus_data/megan/registration_Neel/subj_list_TTTS_test.xlsx'
+    # Call the first step function
+    step1(source_dir, dest_dir, excel_file)
+    print("Step 1 complete")
+
+
+    # ================================================================================
+    # Step 2 - Create chunks of three
+    # ================================================================================
+    step2(dest_dir)
+    print("Step 2 complete")
+
     # ================================================================================
     # Step 3 - Split & Uninterleave echoes
     # ================================================================================
-    # Define subjects as the ones listed in the multi echo images folder
-    # User-defined number of parallel processes
+    # User-defined number of parallel processes: for most machines it is 8
     max_processes = int(input("Please enter the number of parallel processes you want to move forward with: "))
-    # Currently 8
+    # Define subjects as the ones listed in the multi echo images folder
     subjects = natsorted(os.listdir(cwd + '/multiecho-images/'))
     chunks = step3(subjects, cwd, max_processes)
-    # print("Step 3 complete")
+    print("Step 3 complete")
 
     # ================================================================================
     # Step 4 - Segment all uninterleaved echoes
     # ================================================================================
-    # step4(subjects, chunks, cwd)
-    # print("Step 4 complete")
+    step4(subjects, chunks, cwd)
+    print("Step 4 complete")
 
     # ================================================================================
     # Step 5 - Copy Independent bfc for echo 1
     # ================================================================================
-    # step5(subjects, chunks, cwd)
-    # print("Step 5 complete")
+    step5(subjects, chunks, cwd)
+    print("Step 5 complete")
 
     # ================================================================================
     # Step 6 - Create image csv files
     # ================================================================================
-    # step6(subjects, chunks, cwd)
-    # print("Step 6 complete")
+    step6(subjects, chunks, cwd)
+    print("Step 6 complete")
 
     # ================================================================================
     # Step 7 - Create atlasing calls
     # ================================================================================
-    # step7(subjects, chunks, cwd)
-    # print("Step 7 complete")
+    step7(subjects, chunks, cwd)
+    print("Step 7 complete")
 
     # ================================================================================
     # Step 8 - Compose linear/nonlinear warps
@@ -775,20 +845,20 @@ def main():
     # ================================================================================
     # Step 9 - Warp other echoes
     # ================================================================================
-    # step9(subjects, chunks, cwd)
-    # print("Step 9 complete")
+    step9(subjects, chunks, cwd)
+    print("Step 9 complete")
 
     # ================================================================================
     # Step 10 - Create averages and majority votes
     # ================================================================================
-    # step10(subjects, chunks, cwd)
-    # print("Step 10 complete")
+    step10(subjects, chunks, cwd)
+    print("Step 10 complete")
 
     # ================================================================================
     # Step 11 - Compute lodgetjacs
     # ================================================================================
-    # step11(subjects, chunks, cwd)
-    # print("Step 11 complete")
+    step11(subjects, chunks, cwd)
+    print("Step 11 complete")
 
 if __name__ == "__main__":
     main()
